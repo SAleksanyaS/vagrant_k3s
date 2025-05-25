@@ -434,3 +434,31 @@ def get_bot():
             token=settings.SBER_BOT_TOKEN
         )
     )
+
+from dialog_bot_sdk.bot import DialogBot
+from dialog_bot_sdk.config import BotConfig
+from sberchat_bot.config import settings
+
+bot = DialogBot.get_secure_bot(
+    BotConfig(
+        host=settings.SBER_API_ENDPOINT,
+        token=settings.SBER_BOT_TOKEN
+    )
+)
+🔧 Здесь создаётся bot, который затем импортируется в main.py для регистрации обработчиков.
+
+📄 Пример использования в main.py
+python
+Копировать
+Редактировать
+from sberchat_bot.infrastructure.sberchat.bot import bot
+from sberchat_bot.application.handlers.message_handler import handle_incoming_message, handle_reaction
+
+def main():
+    bot.messaging.on_message(handle_incoming_message)
+    bot.reactions.on_reaction(handle_reaction)
+    print("Бот запущен и ожидает сообщения...")
+    bot.run_forever()
+
+if __name__ == "__main__":
+    main()
