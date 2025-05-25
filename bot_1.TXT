@@ -242,3 +242,195 @@ FEEDBACK_DATA_PATH = "data/feedback_data.xlsx"
 ADMIN_CORRECTIONS_PATH = "data/admin_corrections.xlsx"
 FULL_LOG_PATH = "data/full_chat_log.xlsx"
 TAG_ADMIN = "@sasha"
+
+
+
+
+
+
+
+
+
+
+3. domain/models/message.py
+python
+Копировать
+Редактировать
+from dataclasses import dataclass
+
+@dataclass
+class IncomingMessage:
+    text: str
+    user_id: int
+    username: str
+    message_id: str
+🔹 Представляет любое входящее сообщение в системе.
+
+4. domain/models/answer.py
+python
+Копировать
+Редактировать
+from dataclasses import dataclass
+
+@dataclass
+class Answer:
+    text: str
+    question: str
+5. domain/services/answer_selector.py
+python
+Копировать
+Редактировать
+from rapidfuzz import fuzz
+from infrastructure.excel.knowledge_base import get_knowledge_data
+
+def find_best_answer(user_question: str, threshold: int = 60):
+    knowledge = get_knowledge_data()
+    best_match = None
+    highest_score = 0
+
+    for entry in knowledge:
+        score = fuzz.partial_ratio(user_question.lower(), entry['question'].lower())
+        if score > highest_score and score >= threshold:
+            highest_score = score
+            best_match = entry
+
+    return best_match
+🔹 Логика выбора лучшего ответа по частичному совпадению.
+
+6. application/handlers/message_handler.py
+python
+Копировать
+Редактировать
+from application.use_cases.process_user_message import handle_user_message
+from dialog_bot_sdk.entities import Message
+
+def process_message(message: Message):
+    if not message.message or not message.message.text:
+        return
+    if '@bot' not in message.message.text:
+        return
+
+    handle_user_message(message)
+🔹 Базовая валидация и делегирование обработки.
+
+7. application/use_cases/process_user_message.py
+python
+Копировать
+Редактировать
+from infrastructure.excel.full_log import log_full_message
+from infrastructure.excel.chat_history import log_chat
+from infrastructure.sberchat.bot import send_reply
+from domain.models.message import IncomingMessage
+from domain.services.answer_selector import find_best_answer
+from interface.interactive.buttons import get_feedback_buttons
+
+def handle_user_message(message):
+    user_message = message.message.text
+    user_id = message.sender_uid
+    username = str(message.sender_uid)  # если нет ника
+    msg_id = str(message.message_id)
+
+    log_full_message(message)
+
+    matched = find_best_answer(user_message)
+    if matched:
+        send_reply(
+            peer=message.peer,
+            text=f"{matched['answer']}\n\nПонравился ли ответ?",
+            reply_to=msg_id,
+            buttons=get_feedback_buttons()
+        )
+        log_chat(user_message, matched['question'], matched['answer'], username)
+    else:
+        send_reply(peer=message.peer, text="Не нашел ответ. Я запомню это!", reply_to=msg_id)
+8. application/use_cases/process_feedback.py
+python
+Копировать
+Редактировать
+from config.settings import TAG_ADMIN
+from infrastructure.excel.feedback import log_feedback
+from infrastructure.sberchat.bot import send_reply
+
+def handle_feedback(message_id: str, user_id: int, value: str, original_question: str):
+    log_feedback(message_id, user_id, value)
+
+    if value == "dislike":
+        send_reply(
+            peer=...,  # получаем peer из context
+            text=f"{TAG_ADMIN}, пользователь недоволен ответом на: {original_question}"
+        )
+9. infrastructure/excel/*.py
+Пример: knowledge_base.py
+
+python
+Копировать
+Редактировать
+import pandas as pd
+from config.settings import KNOWLEDGE_BASE_PATH
+
+def get_knowledge_data():
+    df = pd.read_excel(KNOWLEDGE_BASE_PATH)
+    return df.to_dict(orient="records")
+Остальные файлы: chat_history.py, feedback.py, corrections.py, full_log.py — реализованы аналогично. Все работают с Pandas, просто читают и записывают строки в нужные Excel-файлы.
+
+10. infrastructure/sberchat/bot.py
+python
+Копировать
+Редактировать
+from dialog_bot_sdk.bot import DialogBot
+from dialog_bot_sdk.interactive_media import InteractiveMediaGroup, InteractiveMediaSelect
+from config.settings import SBER_BOT_TOKEN
+from application.handlers.message_handler import process_message
+
+bot = None
+
+def run_bot():
+    global bot
+    bot = DialogBot.get_secure_bot(SBER_BOT_TOKEN)
+    bot.messaging.on_message(process_message)
+
+def send_reply(peer, text, reply_to=None, buttons=None):
+    from dialog_bot_sdk.entities import UUID
+    uuid = UUID()
+    group = InteractiveMediaGroup(
+        [InteractiveMediaSelect("feedback", "like", "👍"), InteractiveMediaSelect("feedback", "dislike", "👎")]
+    ) if buttons else None
+
+    bot.messaging.reply(
+        peer=peer,
+        mids=[UUID(reply_to)] if reply_to else [],
+        text=text,
+        interactive_media_groups=[group] if group else None
+    )
+11. interface/interactive/buttons.py
+python
+Копировать
+Редактировать
+from dialog_bot_sdk.interactive_media import InteractiveMediaGroup, InteractiveMediaSelect
+
+def get_feedback_buttons():
+    return InteractiveMediaGroup([
+        InteractiveMediaSelect("feedback", "like", "👍"),
+        InteractiveMediaSelect("feedback", "dislike", "👎")
+    ])
+
+
+
+
+
+
+
+
+
+
+from dialog_bot_sdk.bot import DialogBot
+from dialog_bot_sdk.config import BotConfig
+from sberchat_bot.config import settings
+
+def get_bot():
+    return DialogBot.get_secure_bot(
+        BotConfig(
+            host=settings.SBER_API_ENDPOINT,
+            token=settings.SBER_BOT_TOKEN
+        )
+    )
