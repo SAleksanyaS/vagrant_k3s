@@ -1,92 +1,36 @@
 import logging
-from datetime import datetime
+from dialog_bot_sdk.bot import DialogBot
+from dialog_bot_sdk.entities.messaging import MessageHandler, MessageContentType, CommandHandler
+from config.config import BOT_ENDPOINT, BOT_TOKEN, logger
 
-from config.config import BOT_NAME, SASHA_ID, logger
-from infrastructure.sber_sdk import sber_bot
-from infrastructure.excel_repo import FullLogEntry
-from domain.logic import BotLogic
-from interface.keyboard import create_feedback_keyboard
+class SberBot:
+    def __init__(self):
+        # Создаем защищённый бот
+        self.bot = DialogBot.get_secure_bot(BOT_ENDPOINT, BOT_TOKEN)
+        logger.info("Бот инициализирован (endpoint: %s)", BOT_ENDPOINT)
 
-# Инициализация объектов (экземпляры должны быть переданы извне, 
-# здесь пример для понятности, в реальности передавай через DI)
-excel_repo = None
-bot_logic = None
+    def on_message(self, func):
+        # Регистрируем обработчик текстовых сообщений
+        self.bot.messaging.message_handler([
+            MessageHandler(func, MessageContentType.TEXT_MESSAGE)
+        ])
 
-def initialize_handlers(_excel_repo, _bot_logic):
-    global excel_repo, bot_logic
-    excel_repo = _excel_repo
-    bot_logic = _bot_logic
+    def on_command(self, command: str, description: str):
+        def decorator(func):
+            self.bot.messaging.command_handler([
+                CommandHandler(func, command, description=description)
+            ])
+            return func
+        return decorator
 
+    def send_message(self, peer, text, attachments=None):
+        self.bot.messaging.send_message(peer, text, attachments=attachments)
 
-@sber_bot.on_message
-def handle_user_message(params):
-    try:
-        message = params.message
-        # Автор сообщения теперь берем из message.sender или message.author
-        user = None
-        if hasattr(message, "sender") and message.sender is not None:
-            user = message.sender.uid
-        elif hasattr(message, "author") and message.author is not None:
-            user = message.author.uid
-        else:
-            logger.warning("Не удалось получить пользователя из сообщения")
-            return
-
-        if not message.text_message:
-            return  # Работаем только с текстом
-
-        text = message.text_message.text.strip()
-
-        # Логируем все входящие сообщения в общий лог
-        excel_repo.append_full_log(
-            FullLogEntry(user=user, text=text, timestamp=datetime.now(), source="user")
+    def start_polling(self):
+        self.bot.updates.on_updates(
+            do_read_message=True,
+            do_register_commands=True
         )
 
-        # Проверяем упоминание бота в тексте
-        if f"@{BOT_NAME}".lower() not in text.lower():
-            return
-
-        # Обрабатываем сообщение с помощью бизнес-логики
-        result = bot_logic.process_message(user, text)
-        if result.get("reply"):
-            # Отправляем ответ с кнопками обратной связи
-            sber_bot.send_message(params.peer, result["answer"], attachments=create_feedback_keyboard())
-
-    except Exception as e:
-        logger.error("Ошибка при обработке сообщения: %s", e, exc_info=True)
-
-
-@sber_bot.on_message
-def handle_feedback(params):
-    try:
-        message = params.message
-
-        if not message.text_message:
-            return
-        text = message.text_message.text.strip().lower()
-
-        # Аналогично получаем user
-        user = None
-        if hasattr(message, "sender") and message.sender is not None:
-            user = message.sender.uid
-        elif hasattr(message, "author") and message.author is not None:
-            user = message.author.uid
-        else:
-            logger.warning("Не удалось получить пользователя из сообщения (feedback)")
-            return
-
-        peer = params.peer
-
-        if text in ("like", "dislike"):
-            # Для упрощения — оригинальные вопрос/ответ пока неизвестны
-            original_question = "Неизвестен"
-            original_answer = "Неизвестен"
-            mention_sasha = bot_logic.process_feedback(user, original_question, original_answer, text)
-
-            if mention_sasha and SASHA_ID:
-                notification = f"@{SASHA_ID} Пользователь {user} недоволен ответом."
-                sber_bot.send_message(peer, notification)
-            else:
-                sber_bot.send_message(peer, "Спасибо за ваш отзыв!")
-    except Exception as e:
-        logger.error("Ошибка при обработке обратной связи: %s", e, exc_info=True)
+# Создаём один глобальный объект sber_bot, чтобы использовать в других файлах
+sber_bot = SberBot()
