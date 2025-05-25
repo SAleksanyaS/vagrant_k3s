@@ -230,3 +230,15 @@ question	answer
 13. data/history.xlsx
 user_id	text	message_id
 123456	Привет бот	uuid-string-example
+
+
+
+
+
+SBER_BOT_TOKEN = os.getenv("SBER_BOT_TOKEN", "demo_token")
+KNOWLEDGE_BASE_PATH = "data/knowledge_base.xlsx"
+CHAT_HISTORY_PATH = "data/chat_history.xlsx"
+FEEDBACK_DATA_PATH = "data/feedback_data.xlsx"
+ADMIN_CORRECTIONS_PATH = "data/admin_corrections.xlsx"
+FULL_LOG_PATH = "data/full_chat_log.xlsx"
+TAG_ADMIN = "@sasha"
