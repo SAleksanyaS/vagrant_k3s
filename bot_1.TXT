@@ -1,0 +1,232 @@
+1. main.py
+from interface.chat_bot import SberChatBotApp
+from infrastructure.logger import setup_logger
+import config
+import logging
+
+def main():
+    setup_logger()
+    logging.info("Запуск бота...")
+
+    bot_app = SberChatBotApp(token=config.SBER_TOKEN)
+    bot_app.run()
+
+if __name__ == "__main__":
+    main()
+
+
+2. config.py
+SBER_TOKEN = "ваш_токен_сюда"
+KNOWLEDGE_PATH = "data/knowledge.xlsx"
+HISTORY_PATH = "data/history.xlsx"
+LOG_PATH = "logs/bot.log"
+
+3. requirements.txt
+dialog-bot-sdk
+pandas
+openpyxl
+rapidfuzz
+
+4. core/entities.py
+from dataclasses import dataclass
+
+@dataclass
+class QAPair:
+    question: str
+    answer: str
+
+@dataclass
+class ChatMessage:
+    user_id: int
+    message_text: str
+    message_id: str
+
+5. core/exceptions.py
+
+class BotError(Exception):
+    pass
+
+
+6. application/bot_service.py
+
+from typing import Optional
+from core.entities import QAPair
+from infrastructure.excel_repository import ExcelRepository
+from infrastructure.fuzzy_search import fuzzy_search_best_match
+
+class BotService:
+    def __init__(self, knowledge_path: str, history_path: str):
+        self.knowledge_repo = ExcelRepository(knowledge_path)
+        self.history_repo = ExcelRepository(history_path)
+
+    def get_best_answer(self, question: str) -> Optional[QAPair]:
+        knowledge = self.knowledge_repo.read_all()
+        best_match = fuzzy_search_best_match(question, knowledge)
+        return best_match
+
+    def log_message(self, user_id: int, text: str, message_id: str):
+        self.history_repo.append_raw({"user_id": user_id, "text": text, "message_id": message_id})
+
+7. infrastructure/excel_repository.py
+
+import pandas as pd
+from core.entities import QAPair
+
+class ExcelRepository:
+    def __init__(self, filepath: str):
+        self.filepath = filepath
+        self.columns = ['question', 'answer']
+
+    def read_all(self) -> list[QAPair]:
+        try:
+            df = pd.read_excel(self.filepath)
+            return [QAPair(row['question'], row['answer']) for _, row in df.iterrows()]
+        except FileNotFoundError:
+            return []
+
+    def append(self, qa_pair: QAPair):
+        try:
+            df = pd.read_excel(self.filepath)
+        except FileNotFoundError:
+            df = pd.DataFrame(columns=self.columns)
+        df = pd.concat([df, pd.DataFrame([{"question": qa_pair.question, "answer": qa_pair.answer}])], ignore_index=True)
+        df.to_excel(self.filepath, index=False)
+
+    def append_raw(self, data: dict):
+        try:
+            df = pd.read_excel(self.filepath)
+        except FileNotFoundError:
+            df = pd.DataFrame()
+        df = pd.concat([df, pd.DataFrame([data])], ignore_index=True)
+        df.to_excel(self.filepath, index=False)
+
+8. infrastructure/fuzzy_search.py
+
+from rapidfuzz import process
+from core.entities import QAPair
+
+def fuzzy_search_best_match(query: str, knowledge: list[QAPair]) -> QAPair | None:
+    choices = [qa.question for qa in knowledge]
+    if not choices:
+        return None
+    match = process.extractOne(query, choices, score_cutoff=60)
+    if match:
+        matched_question = match[0]
+        for qa in knowledge:
+            if qa.question == matched_question:
+                return qa
+    return None
+
+
+9. infrastructure/logger.py
+import logging
+from config import LOG_PATH
+
+def setup_logger():
+    logging.basicConfig(
+        filename=LOG_PATH,
+        level=logging.INFO,
+        format='%(asctime)s %(levelname)s %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S',
+    )
+
+10. interface/chat_bot.py
+
+import logging
+from dialog_bot_sdk import DialogBot
+from application.bot_service import BotService
+from interface.handlers import MessageHandler
+from config import KNOWLEDGE_PATH, HISTORY_PATH
+
+class SberChatBotApp:
+    def __init__(self, token: str):
+        self.bot = DialogBot(token)
+        self.bot_service = BotService(KNOWLEDGE_PATH, HISTORY_PATH)
+        self.handler = MessageHandler(self.bot, self.bot_service)
+
+        self.bot.messaging.on_message(self.handler.on_message)
+        self.bot.messaging.on_reaction(self.handler.on_reaction)  # <-- добавлено
+
+    def run(self):
+        logging.info("Бот запущен и готов к работе.")
+        self.bot.run_forever()
+
+
+
+11. interface/handlers.py
+
+import logging
+from dialog_bot_sdk.entities import Message
+from dialog_bot_sdk.messaging import InteractiveMedia, InteractiveMediaGroup
+
+class MessageHandler:
+    def __init__(self, bot, bot_service):
+        self.bot = bot
+        self.bot_service = bot_service
+
+    async def on_message(self, update):
+        message: Message = update.message
+        text = message.text or ""
+        user_id = message.author.user_id
+        peer = message.peer
+
+        # Логируем все сообщения
+        self.bot_service.log_message(user_id, text, message.message_id)
+
+        # Проверяем, что сообщение текстовое и содержит упоминание бота
+        if not text.strip():
+            return
+        if not self._bot_mentioned(text):
+            return
+
+        question = self._strip_bot_mention(text)
+        qa_pair = self.bot_service.get_best_answer(question)
+        if qa_pair:
+            answer_text = qa_pair.answer
+        else:
+            answer_text = "Извините, не знаю ответа на этот вопрос."
+
+        interactive = InteractiveMediaGroup(
+            medias=[
+                InteractiveMedia(type="button", text="👍", value="like"),
+                InteractiveMedia(type="button", text="👎", value="dislike"),
+            ]
+        )
+
+        full_text = f"{answer_text}\n\nПонравился ли ответ?"
+
+        await self.bot.messaging.send_message(peer, full_text, interactive_media_groups=[interactive])
+
+    async def on_reaction(self, update):
+        # Здесь update — объект с информацией о реакции пользователя на сообщение
+        # Нам нужна информация о типе реакции (value), peer, user_id и т.д.
+        reaction = update.reaction
+        value = reaction.value  # "like" или "dislike"
+        user_id = update.user_id
+        peer = update.peer
+
+        if value == "dislike":
+            # Отправляем сообщение с упоминанием @sasha в чат
+            text = "@sasha, пользователь не доволен ответом."
+            await self.bot.messaging.send_message(peer, text)
+
+    def _bot_mentioned(self, text: str) -> bool:
+        return "@бот" in text.lower()
+
+    def _strip_bot_mention(self, text: str) -> str:
+        return text.lower().replace("@бот", "").strip()
+
+
+
+
+12. data/knowledge.xlsx
+question	answer
+Как работает бот?	Бот отвечает на ваши вопросы.
+Что такое Сберчат?	Сберчат — это платформа.
+Как добавить нового пользователя?	Добавление пользователей не реализовано.
+Как обучить бота?	Пока обучение через админов.
+Привет	Привет! Чем могу помочь?
+
+13. data/history.xlsx
+user_id	text	message_id
+123456	Привет бот	uuid-string-example
