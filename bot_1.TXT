@@ -469,3 +469,53 @@ if __name__ == "__main__":
 Логирование: события и ошибки логируются в файл bot.log и выводятся в консоль.
 Команды /start, /help: реализованы для справки по функциональности бота.
 Бот готов к запуску после настройки .env. Все модули содержат подробные комментарии, упрощающие понимание и поддержку кода.
+
+
+
+from dialog_bot_sdk.bot import DialogBot
+from dialog_bot_sdk.entities.messaging import MessageHandler, MessageContentType, CommandHandler
+import logging
+
+
+class SberBot:
+    def __init__(self, endpoint: str, token: str, cert_path: str):
+        self.bot = DialogBot.get_secure_bot(
+            endpoint,
+            token,
+            cert_path
+        )
+        logging.info(f"Бот инициализирован (endpoint: {endpoint})")
+
+    def on_message(self, func):
+        self.bot.messaging.message_handler([
+            MessageHandler(func, MessageContentType.TEXT_MESSAGE)
+        ])
+
+    def on_command(self, command: str, description: str):
+        def decorator(func):
+            self.bot.messaging.command_handler([
+                CommandHandler(func, command, description=description)
+            ])
+            return func
+        return decorator
+
+    def start_polling(self):
+        self.bot.updates.on_updates(
+            do_read_message=True,
+            do_register_commands=True
+        )
+
+
+
+sber_bot = SberBot(endpoint, token, cert_path)
+
+@sber_bot.on_command("start", "Запуск бота")
+def start_handler(message: UpdateMessage):
+    # ...
+
+@sber_bot.on_message
+def echo_handler(message: UpdateMessage):
+    # ...
+
+sber_bot.start_polling()
+
