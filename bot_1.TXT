@@ -1,53 +1,310 @@
-from config.config import BOT_NAME, logger
+config/config.py
+Конфигурация бота: здесь задаются константы – токен доступа и пути к файлам Excel. В этом примере мы считываем токен из переменной окружения, а пути к файлам указаны статично.
+python
+Копировать
+Редактировать
+import os
+
+# Токен бота (строка аутентификации SberChat). 
+# Предполагается задать через переменную окружения SBERCHAT_BOT_TOKEN.
+BOT_TOKEN = os.getenv("SBERCHAT_BOT_TOKEN", "")
+
+# Пути к файлам Excel для базы знаний и логов.
+KNOWLEDGE_FILE = "knowledge_base.xlsx"
+LOG_FILE = "bot_logs.xlsx"
+Комментарий: флаг SBERCHAT_BOT_TOKEN следует установить в окружении перед запуском бота.
+domain/knowledge_base.py
+Модуль бизнес-логики для поиска ответа по базе знаний. Здесь класс KnowledgeBase инкапсулирует алгоритм поиска наиболее похожего вопроса по тексту сообщения и возвращает соответствующий ответ. Для оценки сходства строк используется difflib.SequenceMatcher
+typesense.org
+. Чем выше коэффициент (ratio), тем более похожи строки. В коде мы проходим по всем записям базы (вопрос–ответ) и выбираем максимальный коэффициент. Если максимальный коэффициент оказался ниже некоторого порога (например, 0.5), возвращаем сообщение об отсутствии ответа. Это обеспечивает надежность поиска.
+python
+Копировать
+Редактировать
+from difflib import SequenceMatcher
+
+class KnowledgeBase:
+    def __init__(self, repository):
+        # repository должен предоставлять метод get_all(), возвращающий список (вопрос, ответ)
+        self.repo = repository
+
+    def find_best_answer(self, query: str) -> str:
+        query = query.strip().lower()
+        best_score = 0.0
+        best_answer = None
+        for question, answer in self.repo.get_all():
+            if question is None or answer is None:
+                continue
+            # Сравниваем строки без учета регистра
+            score = SequenceMatcher(None, question.lower(), query).ratio()
+            if score > best_score:
+                best_score = score
+                best_answer = answer
+        # Проверяем порог сходства (например, 50% совпадения)
+        if best_score < 0.5 or best_answer is None:
+            return "Извините, я не знаю ответ на этот вопрос."
+        return best_answer
+Комментарий: использование SequenceMatcher из стандартной библиотеки Python позволяет эффективно вычислять коэффициент похожести строк
+typesense.org
+. Если ни одна запись не схожа с запросом, возвращается вежливый отказ.
+application/handle_message.py
+Слой приложений: здесь функция handle_message реализует сценарий обработки входящего текстового сообщения. Алгоритм следующий:
+Проверяем, что сообщение текстовое и содержит тег бота @rmoconboarding. Только в этом случае отвечаем (иначе игнорируем)
+codu.co
+.
+Удаляем из текста упоминание бота и ищем лучший ответ через домен KnowledgeBase.
+Логируем сообщение и ответ в Excel (см. Infrastructure ниже).
+Формируем ответное сообщение с кнопками «лайк/дизлайк» и отправляем его в чат.
+python
+Копировать
+Редактировать
+from config.config import KNOWLEDGE_FILE, LOG_FILE
+from infrastructure.excel_repository import ExcelRepository
+from domain.knowledge_base import KnowledgeBase
+from interface.message_builder import MessageBuilder
+
+# Предварительно создаем репозиторий и экземпляр домена
+excel_repo = ExcelRepository(KNOWLEDGE_FILE, LOG_FILE)
+knowledge = KnowledgeBase(excel_repo)
+
+def handle_message(message_event, api):
+    """
+    Обработчик нового сообщения. 
+    message_event содержит атрибуты: peer (идентификатор чата) и text.
+    api — экземпляр SberChatAPI для отправки сообщений.
+    """
+    try:
+        text = message_event.text or ""
+        peer = message_event.peer
+        # Отвечаем только на текстовые сообщения с упоминанием бота
+        if not text or "@rmoconboarding" not in text:
+            return
+        # Удаляем тег бота из текста перед поиском
+        query = text.replace("@rmoconboarding", "").strip()
+        # Ищем лучший ответ в базе
+        answer = knowledge.find_best_answer(query)
+        # Логируем историю чата (peer, запрос, ответ)
+        excel_repo.log_chat(peer, query, answer)
+        # Формируем сообщение с кнопками «👍»/«👎»
+        builder = MessageBuilder(peer)
+        builder.set_text(answer)
+        builder.add_button("👍", "like")
+        builder.add_button("👎", "dislike")
+        response = builder.build()
+        # Отправляем сообщение через API
+        api.send_message(response)
+    except Exception as e:
+        # При ошибке логируем полный стек в лог-файл, но не кидаем исключение дальше
+        excel_repo.log_error(str(e))
+Комментарий: в этом слое мы компонуем готовые элементы. Отметим, что весь код обернут в try/except, чтобы бот не падал при ошибках и записывал их в лог
+medium.com
+.
+application/handle_callback.py
+Обработка обратной связи по кнопкам. Когда пользователь нажимает «лайк» или «дизлайк», вызывается handle_callback. Если пользователь поставил «лайк», бот ничего не делает, кроме логирования. Если «дизлайк», бот делает reply в чат с упоминанием @sasha и логирует факт недовольства.
+python
+Копировать
+Редактировать
+from config.config import LOG_FILE
+from infrastructure.excel_repository import ExcelRepository
+
+excel_repo = ExcelRepository(None, LOG_FILE)  # None для базы знаний, будет использоваться только лог-файл
+
+def handle_callback(callback_event, api):
+    """
+    Обработчик нажатия кнопки. 
+    callback_event содержит: peer (чат), data ('like' или 'dislike'), 
+    и message_id (ID исходного сообщения с ответом).
+    """
+    try:
+        peer = callback_event.peer
+        action = callback_event.data  # 'like' или 'dislike'
+        msg_id = callback_event.message_id
+        # Логируем обратную связь
+        excel_repo.log_feedback(peer, msg_id, action)
+        if action == "dislike":
+            # Пользователь недоволен — делаем reply с сообщением
+            reply_text = "@sasha Пользователь недоволен ответом"
+            api.send_message(peer, reply_text, reply_to=msg_id)
+    except Exception as e:
+        excel_repo.log_error(str(e))
+Комментарий: в handle_callback мы логируем оба события («лайк» и «дизлайк») в таблицу обратной связи. При «дизлайке» бот делает ответное сообщение (reply) с текстом «@sasha Пользователь недоволен ответом» в тот же чат.
+infrastructure/excel_repository.py
+Инфраструктурный слой для работы с Excel. Класс ExcelRepository читает базу знаний и ведет логи. Для работы с файлами Excel используется библиотека openpyxl
+geeksforgeeks.org
+. Она позволяет открывать, изменять и сохранять *.xlsx-файлы. Метод append() позволяет добавлять данные в новую строку в конце листа
+stackoverflow.com
+.
+python
+Копировать
+Редактировать
+import os
 from datetime import datetime
-from infrastructure.sber_sdk import sber_bot
-from domain.logic import bot_logic  # если нужна логика
-from infrastructure.excel_repo import excel_repo  # если нужна запись логов
+from openpyxl import Workbook, load_workbook
 
-def create_feedback_keyboard():
-    # Здесь должен быть код создания клавиатуры с кнопками лайк/дизлайк
-    pass
+class ExcelRepository:
+    def __init__(self, kb_path, log_path):
+        """
+        kb_path: путь к файлу базы знаний (.xlsx) или None.
+        log_path: путь к файлу логов (.xlsx).
+        """
+        self.kb_path = kb_path
+        self.log_path = log_path
 
-@sber_bot.on_message
-def handle_user_message(params):
-    try:
-        message = params.message
-        if not message.text_message:
-            return  # Только текстовые сообщения
-        text = message.text_message.text.strip()
+    def get_all(self):
+        """Читает все (вопрос, ответ) из базы знаний."""
+        if not self.kb_path or not os.path.exists(self.kb_path):
+            return []
+        wb = load_workbook(self.kb_path)
+        sheet = wb.active
+        qa_list = []
+        for row in sheet.iter_rows(min_row=2, values_only=True):
+            question, answer = row[:2]
+            qa_list.append((str(question), str(answer)))
+        return qa_list
 
-        # Логируем полный чат в файл, если нужно
-        if excel_repo:
-            excel_repo.append_full_log(
-                FullLogEntry(user=None, text=text, timestamp=datetime.now(), source="user")
-            )
+    def _init_log_workbook(self):
+        """Создает новый файл логов с нужными листами, если его нет."""
+        wb = Workbook()
+        ws_chat = wb.active
+        ws_chat.title = "chat_history"
+        ws_chat.append(["Timestamp", "Peer", "Message", "Answer"])
+        ws_fb = wb.create_sheet("feedback")
+        ws_fb.append(["Timestamp", "Peer", "AnswerMsgID", "Feedback"])
+        ws_err = wb.create_sheet("full_log")
+        ws_err.append(["Timestamp", "Error"])
+        wb.save(self.log_path)
 
-        # Проверяем упоминание бота
-        if f"@{BOT_NAME}".lower() not in text.lower():
-            return
+    def _append_row(self, sheet_name, row):
+        """Добавляет строку row на лист sheet_name, создавая файл/лист при необходимости."""
+        # Если файл логов не существует, создаем с заголовками
+        if not os.path.exists(self.log_path):
+            self._init_log_workbook()
+        wb = load_workbook(self.log_path)
+        if sheet_name not in wb.sheetnames:
+            # Если лист неожиданно отсутствует, создаем его (без заголовка)
+            wb.create_sheet(sheet_name)
+        ws = wb[sheet_name]
+        ws.append(row)
+        wb.save(self.log_path)
 
-        # Обрабатываем сообщение (тут можно вызвать бизнес-логику)
-        result = bot_logic.process_message(None, text)  # user=None, не учитываем
-        if result.get("reply"):
-            sber_bot.send_message(params.peer, result["answer"], attachments=create_feedback_keyboard())
+    def log_chat(self, peer, message, answer):
+        """Логирует историю чата: peer, текст запроса и ответ."""
+        timestamp = datetime.now().isoformat()
+        self._append_row("chat_history", [timestamp, peer, message, answer])
 
-    except Exception as e:
-        logger.error("Ошибка при обработке сообщения: %s", e, exc_info=True)
+    def log_feedback(self, peer, message_id, feedback):
+        """Логирует обратную связь: peer, ID сообщения-ответа и тип (like/dislike)."""
+        timestamp = datetime.now().isoformat()
+        self._append_row("feedback", [timestamp, peer, message_id, feedback])
 
-@sber_bot.on_message
-def handle_feedback(params):
-    try:
-        message = params.message
-        if not message.text_message:
-            return
-        text = message.text_message.text.strip().lower()
+    def log_error(self, error_text):
+        """Логирует ошибки или события в общий лог."""
+        timestamp = datetime.now().isoformat()
+        self._append_row("full_log", [timestamp, error_text])
+Комментарий: методы _append_row и append() из openpyxl добавляют новые строки в конец листа
+stackoverflow.com
+. Если файл логов не существует, мы создаем его с тремя листами: chat_history, feedback, full_log и заголовками колонок. При необходимости добавляем новые листы.
+infrastructure/sberchat_sdk.py
+Абстракция работы с SberChat API. Этот модуль показывает примерный интерфейс взаимодействия с SDK мессенджера. Реальная реализация будет использовать официальный SDK или REST API SberChat. Здесь приведен псевдокод:
+python
+Копировать
+Редактировать
+class SberChatAPI:
+    def __init__(self, token):
+        # Инициализация подключения к SberChat (например, через WebSocket или HTTP)
+        self.token = token
+        self.message_handler = None
+        self.button_handler = None
 
-        if text in ("like", "dislike"):
-            # Просто благодарим за отзыв без получения пользователя
-            sber_bot.send_message(params.peer, "Спасибо за ваш отзыв!")
-    except Exception as e:
-        logger.error("Ошибка при обработке обратной связи: %s", e, exc_info=True)
+    def on_message(self, handler):
+        """Регистрация функции-обработчика новых сообщений."""
+        self.message_handler = handler
 
-def register_handlers():
-    sber_bot.on_message(handle_user_message)
-    sber_bot.on_message(handle_feedback)
+    def on_button(self, handler):
+        """Регистрация функции-обработчика нажатий кнопок."""
+        self.button_handler = handler
+
+    def send_message(self, message, reply_to=None):
+        """
+        Отправляет сообщение в чат. 
+        message: объект, созданный MessageBuilder (см. interface/message_builder).
+        reply_to: опционально ID сообщения, на которое делаем reply.
+        """
+        # Пример: вызов API отправки сообщения с кнопками
+        # Реализация зависит от конкретного SDK SberChat.
+        pass
+
+    def start(self):
+        """Запускает цикл обработки входящих событий."""
+        # В реальности это может быть WebSocket-подключение или polling.
+        while True:
+            event = self._get_next_event()
+            if event.type == 'message':
+                if self.message_handler:
+                    self.message_handler(event, self)
+            elif event.type == 'callback':
+                if self.button_handler:
+                    self.button_handler(event, self)
+
+    def _get_next_event(self):
+        """Заглушка: получает следующее событие (сообщение или нажатие кнопки)."""
+        pass
+Комментарий: этот класс показан для наглядности. Конкретный код отправки/получения сообщений зависит от версии SDK SberChat. Мы предполагаем наличие методов для регистрации обработчиков и отправки сообщения (с кнопками) по peer и reply_to.
+interface/message_builder.py
+Модуль формирования ответных сообщений с кнопками. С точки зрения интерфейса пользователя, мы используем кнопки (widgets) для отзывов («лайк»/«дизлайк»). Многие мессенджеры (например, Google Chat) позволяют создавать интерактивные элементы интерфейса (кнопки) в карточках сообщения
+developers.google.com
+. Здесь класс MessageBuilder собирает текст и список кнопок, предоставляя структурированный объект для отправки через API.
+python
+Копировать
+Редактировать
+class Button:
+    def __init__(self, label, action):
+        """
+        label: текст на кнопке (например, '👍' или '👎').
+        action: идентификатор действия ('like' или 'dislike').
+        """
+        self.label = label
+        self.action = action
+
+class Message:
+    def __init__(self, peer, text, buttons=None):
+        self.peer = peer
+        self.text = text
+        self.buttons = buttons or []
+
+class MessageBuilder:
+    def __init__(self, peer):
+        self.peer = peer
+        self.text = ""
+        self.buttons = []
+
+    def set_text(self, text):
+        self.text = text
+
+    def add_button(self, label, action):
+        self.buttons.append(Button(label, action))
+
+    def build(self):
+        """Возвращает готовое сообщение с кнопками."""
+        return Message(self.peer, self.text, self.buttons)
+Комментарий: в этом слое мы отделяем форматирование ответа от бизнес-логики. Мы создаем объект сообщения с нужным текстом и кнопками (в данном случае «👍» и «👎» с соответствующим action), который затем передается в SberChatAPI.send_message().
+main.py
+Главный скрипт запуска бота. Здесь мы инициализируем API-клиент SberChat, регистрируем обработчики и запускаем цикл обработки. В реальном коде может использоваться многопоточность или асинхронность, в зависимости от SDK. В упрощенном виде:
+python
+Копировать
+Редактировать
+from config.config import BOT_TOKEN
+from infrastructure.sberchat_sdk import SberChatAPI
+from application.handle_message import handle_message
+from application.handle_callback import handle_callback
+
+def main():
+    # Создаем API-клиент бота
+    api = SberChatAPI(BOT_TOKEN)
+    # Регистрируем обработчики событий
+    api.on_message(handle_message)
+    api.on_button(handle_callback)
+    # Запускаем бота (прослушивание событий)
+    api.start()
+
+if __name__ == "__main__":
+    main()
