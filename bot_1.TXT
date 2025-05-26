@@ -1,83 +1,53 @@
+from config.config import BOT_NAME, logger
 from datetime import datetime
-from config.config import BOT_NAME, SASHA_ID, logger
-from domain.models import FullLogEntry  # если есть такая модель
-from infrastructure.sber_sdk import sber_bot  # Импортируем sber_bot, если он глобален
-from utils.keyboard import create_feedback_keyboard  # пример импорта клавиатуры
+from infrastructure.sber_sdk import sber_bot
+from domain.logic import bot_logic  # если нужна логика
+from infrastructure.excel_repo import excel_repo  # если нужна запись логов
 
+def create_feedback_keyboard():
+    # Здесь должен быть код создания клавиатуры с кнопками лайк/дизлайк
+    pass
 
-excel_repo = None
-bot_logic = None
+@sber_bot.on_message
+def handle_user_message(params):
+    try:
+        message = params.message
+        if not message.text_message:
+            return  # Только текстовые сообщения
+        text = message.text_message.text.strip()
 
-
-def initialize_handlers(_excel_repo, _bot_logic):
-    global excel_repo, bot_logic
-    excel_repo = _excel_repo
-    bot_logic = _bot_logic
-
-
-def register_handlers(sber_bot_instance):
-    @sber_bot_instance.on_message
-    def handle_user_message(params):
-        try:
-            message = params.message
-            user = None
-            if hasattr(message, "sender") and message.sender is not None:
-                user = message.sender.uid
-            elif hasattr(message, "author") and message.author is not None:
-                user = message.author.uid
-            else:
-                logger.warning("Не удалось получить пользователя из сообщения")
-                return
-
-            if not message.text_message:
-                return
-
-            text = message.text_message.text.strip()
-
+        # Логируем полный чат в файл, если нужно
+        if excel_repo:
             excel_repo.append_full_log(
-                FullLogEntry(user=user, text=text, timestamp=datetime.now(), source="user")
+                FullLogEntry(user=None, text=text, timestamp=datetime.now(), source="user")
             )
 
-            if f"@{BOT_NAME}".lower() not in text.lower():
-                return
+        # Проверяем упоминание бота
+        if f"@{BOT_NAME}".lower() not in text.lower():
+            return
 
-            result = bot_logic.process_message(user, text)
-            if result.get("reply"):
-                sber_bot_instance.send_message(params.peer, result["answer"], attachments=create_feedback_keyboard())
+        # Обрабатываем сообщение (тут можно вызвать бизнес-логику)
+        result = bot_logic.process_message(None, text)  # user=None, не учитываем
+        if result.get("reply"):
+            sber_bot.send_message(params.peer, result["answer"], attachments=create_feedback_keyboard())
 
-        except Exception as e:
-            logger.error("Ошибка при обработке сообщения: %s", e, exc_info=True)
+    except Exception as e:
+        logger.error("Ошибка при обработке сообщения: %s", e, exc_info=True)
 
-    @sber_bot_instance.on_message
-    def handle_feedback(params):
-        try:
-            message = params.message
+@sber_bot.on_message
+def handle_feedback(params):
+    try:
+        message = params.message
+        if not message.text_message:
+            return
+        text = message.text_message.text.strip().lower()
 
-            if not message.text_message:
-                return
-            text = message.text_message.text.strip().lower()
+        if text in ("like", "dislike"):
+            # Просто благодарим за отзыв без получения пользователя
+            sber_bot.send_message(params.peer, "Спасибо за ваш отзыв!")
+    except Exception as e:
+        logger.error("Ошибка при обработке обратной связи: %s", e, exc_info=True)
 
-            user = None
-            if hasattr(message, "sender") and message.sender is not None:
-                user = message.sender.uid
-            elif hasattr(message, "author") and message.author is not None:
-                user = message.author.uid
-            else:
-                logger.warning("Не удалось получить пользователя из сообщения (feedback)")
-                return
-
-            peer = params.peer
-
-            if text in ("like", "dislike"):
-                original_question = "Неизвестен"
-                original_answer = "Неизвестен"
-                mention_sasha = bot_logic.process_feedback(user, original_question, original_answer, text)
-
-                if mention_sasha and SASHA_ID:
-                    notification = f"@{SASHA_ID} Пользователь {user} недоволен ответом."
-                    sber_bot_instance.send_message(peer, notification)
-                else:
-                    sber_bot_instance.send_message(peer, "Спасибо за ваш отзыв!")
-
-        except Exception as e:
-            logger.error("Ошибка при обработке обратной связи: %s", e, exc_info=True)
+def register_handlers():
+    sber_bot.on_message(handle_user_message)
+    sber_bot.on_message(handle_feedback)
